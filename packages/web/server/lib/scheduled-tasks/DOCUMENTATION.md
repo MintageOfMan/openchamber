@@ -2,6 +2,12 @@
 
 Server-owned scheduled task runtime and routes for OpenChamber-only automation.
 
+The task-card catch-up checkbox writes exactly `{ id, catchUpOnStartup }` through
+the existing task PUT route. This patch is merged with the current definition
+under the project lock, preserving enablement, target, configuration and runtime
+state. It does not validate an unchanged backend selection or cancel a waiting
+manual prompt. Other task writes retain their full-definition contract.
+
 ## Scope
 
 - Per-project scheduled task persistence is owned by `packages/web/server/lib/projects/project-config.js`.
@@ -93,8 +99,10 @@ in shared project config under the project write lock:
   `sessionID` as a successful dispatch (`ok` follows run status, with
   `persistError` set) rather than a hard 500; the run API and Scheduled Tasks
   UI surface `persistError` as a warning toast.
-- The claim predicate rejects a duplicate solely via `lastScheduledFor` within
-  slack of this occurrence. It does not consult advanced on-disk `nextRunAt`
+- Ordinary scheduled claims require an enabled task and reject
+  `lastScheduledFor` within 5 seconds of this occurrence. They do not require
+  schedule equality or reject a newer claim outside that window.
+  The predicate does not consult advanced on-disk `nextRunAt`
   (that field is routinely overwritten by a second instance syncing inside
   `TASK_DUE_SLACK_MS`, including on later days when `lastScheduledFor` is already
   set from a prior claim).
@@ -104,6 +112,46 @@ in shared project config under the project write lock:
 Manual `runNow` does not claim a schedule occurrence. It also runs paused
 (`enabled: false`) tasks — that is the point of the button — while scheduled
 dispatches still skip disabled tasks, and completion never re-arms a paused task.
+
+## Startup catch-up
+
+`catchUpOnStartup: true` opts a task into one missed run at server startup.
+Absent or false leaves catch-up off. The startup sync captures only a persisted,
+past `state.nextRunAt` from an enabled, opted-in task. It uses that timestamp as
+`scheduledFor`, with the normal queue, concurrency limits and locked occurrence
+claim. Daily, weekly, cron and once tasks use the same path. A recovered once
+task is consumed after dispatch or admission, including a failed attempt.
+
+The pending recovery survives ordinary list, save and project sync calls.
+Disable, schedule changes, option withdrawal, removal and a newer occurrence
+claim invalidate it. Both dispatch paths recheck the schedule, enabled state,
+opt-in and last claim under the project lock. Claiming advances to a future
+occurrence or explicitly clears `nextRunAt`; recovery never reconstructs missed
+cron history or replays a backlog. Manual runs keep their existing behavior.
+
+The runtime's `waitForOpenCodeStartup` dependency must wait for OpenCode's port
+and readiness before a recovery claims its occurrence. The startup pipeline
+launches OpenCode bootstrap asynchronously; its return does not establish
+readiness. Recovery holds a concurrency slot during this wait. A readiness
+failure enters the existing scheduled failure path after the locked claim:
+new-session tasks record `error`, existing-session tasks record `failed`, once
+tasks are consumed and recurring tasks rearm in the future. No session is
+created or prompt admitted on readiness failure. A task that lost eligibility
+or its occurrence claim while waiting is skipped without overwriting the
+winner's status. Ordinary dispatch still uses `waitForOpenCodeReady`.
+
+Cancelling a recovery ends its readiness wait and releases that wait's slot
+before replacement work runs. Shared backend startup continues independently;
+its late completion cannot release a replacement run's slot. Stopping the
+scheduler cancels pending readiness waits too.
+
+### Why recovery keeps a separate pending occurrence
+
+Task-list reads also synchronize schedules. Keeping the captured occurrence
+until dispatch prevents those reads from advancing or duplicating a recovery.
+Other server instances may advance the persisted cursor during their own sync,
+so the locked claim checks `lastScheduledFor` and schedule identity rather than
+requiring that cursor still equal the captured timestamp.
 
 ## Existing-session tasks
 
@@ -369,6 +417,8 @@ format (UI/JSON-only today); `daily`/`weekly`/`once` schedules remain UI/JSON-on
 Runtime state (`lastRunAt`, `nextRunAt`, `lastStatus`, `lastError`, `lastSessionId`,
 `lastDurationMs`, `lastRunIsolated`, `lastRunBranch`) is never written to the markdown file —
 it continues to live in the project config state store.
+`catchUpOnStartup` also stays in per-machine project config. Loop frontmatter
+does not define it; reconciliation preserves the local choice.
 
 ## Loop reconciliation rules
 

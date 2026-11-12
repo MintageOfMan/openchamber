@@ -7,6 +7,8 @@ export type ScheduledTask = {
   id: string;
   name: string;
   enabled: boolean;
+  /** Run one missed occurrence at server startup; absent means off. */
+  catchUpOnStartup?: boolean;
   targetSessionId?: string;
   /** Absolute path of the `.agents/loops/*.md` file driving this task, when
    *  any. Present only for loop-sourced tasks; unknown to older clients. */

@@ -73,6 +73,29 @@ describe('scheduled-task service list', () => {
   });
 });
 
+it('changes catch-up without validating the backend or cancelling a concurrently paused task', async () => {
+  const previous = { ...loopTask, id: 'task-1', loopFile: undefined, targetSessionId: 'session-existing' };
+  const stored = { ...previous, enabled: false, catchUpOnStartup: true };
+  const cancelWaitingPrompt = vi.fn(async () => {});
+  const validateTarget = vi.fn(async () => { throw new Error('Backend is still starting'); });
+  const readModelCatalog = vi.fn(async () => []);
+  const { service, projectConfigRuntime } = createService({
+    projectConfigRuntime: {
+      listScheduledTasks: vi.fn().mockResolvedValueOnce([previous]).mockResolvedValue([stored]),
+      upsertScheduledTask: vi.fn(async () => ({ task: stored, created: false })),
+    },
+    scheduledTasksRuntime: { cancelWaitingPrompt, validateTarget },
+    readModelCatalog,
+  });
+  const input = { id: previous.id, catchUpOnStartup: true };
+  const result = await service.upsert('project-test', input);
+  expect(result.task).toEqual(stored);
+  expect(projectConfigRuntime.upsertScheduledTask).toHaveBeenCalledWith('project-test', input);
+  expect(validateTarget).not.toHaveBeenCalled();
+  expect(readModelCatalog).not.toHaveBeenCalled();
+  expect(cancelWaitingPrompt).not.toHaveBeenCalled();
+});
+
 describe('scheduled-task loop-file mutations', () => {
   it('updates only enabled in loop frontmatter and reconciles the task', async () => {
     const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'oc-loop-toggle-'));

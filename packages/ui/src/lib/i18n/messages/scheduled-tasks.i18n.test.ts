@@ -12,6 +12,8 @@ import { dict as pl } from './pl';
 import { dict as zhCN } from './zh-CN';
 import { dict as zhTW } from './zh-TW';
 import { dict as tr } from './tr';
+import { dict as ar } from './ar';
+import { dict as he } from './he';
 
 const keys = [
   'sessions.scheduledTasks.dialog.description',
@@ -45,5 +47,20 @@ test('scheduled queue outcomes sit beside the legacy status keys', () => {
     const catalogKeys = Object.keys(catalog);
     const start = catalogKeys.indexOf('sessions.scheduledTasks.dialog.status.success');
     expect(catalogKeys.slice(start, start + statuses.length)).toEqual(statuses.map((status) => `sessions.scheduledTasks.dialog.status.${status}`));
+  }
+});
+
+test('startup catch-up has translated labels and a task-specific accessible name', () => {
+  const catchUpKeys = [
+    'sessions.scheduledTasks.dialog.catchUpOnStartup.label',
+    'sessions.scheduledTasks.dialog.catchUpOnStartup.hint',
+    'sessions.scheduledTasks.dialog.catchUpOnStartup.aria',
+  ] as const;
+  for (const catalog of [de, fr, nl, es, ja, ptBR, uk, ko, pl, zhCN, zhTW, tr, ar, he]) {
+    for (const key of catchUpKeys) {
+      expect(catalog[key]).toBeTruthy();
+      expect(catalog[key]).not.toBe(en[key]);
+    }
+    expect(catalog['sessions.scheduledTasks.dialog.catchUpOnStartup.aria']).toContain('{taskName}');
   }
 });

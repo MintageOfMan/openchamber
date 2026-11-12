@@ -33,9 +33,21 @@ describe('scheduledTaskEditorDraft.toDraft', () => {
     expect(draft.runInWorktree).toBe(false);
     expect(draft.baseBranch).toBe('');
   });
+
+  test('startup catch-up defaults off and keeps an existing opt-in', () => {
+    expect(toDraft(null, defaults).catchUpOnStartup).toBe(false);
+    expect(toDraft(baseTask, defaults).catchUpOnStartup).toBe(false);
+    expect(toDraft({ ...baseTask, catchUpOnStartup: true }, defaults).catchUpOnStartup).toBe(true);
+  });
 });
 
 describe('scheduledTaskEditorDraft.buildScheduledTaskPayload', () => {
+  test('carries the task-card catch-up option through editing and scope moves', () => {
+    const draft = toDraft({ ...baseTask, catchUpOnStartup: true }, defaults);
+    expect(buildScheduledTaskPayload(draft).catchUpOnStartup).toBe(true);
+    expect(buildScheduledTaskPayload({ ...draft, catchUpOnStartup: false }).catchUpOnStartup).toBe(false);
+  });
+
   test('sends the isolation fields for a new-session task', () => {
     const draft: ScheduledTaskDraft = {
       ...toDraft(baseTask, defaults),

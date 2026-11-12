@@ -23,6 +23,90 @@ const createRuntime = async () => {
 };
 
 describe('project-config runtime', () => {
+  it.each([true, false])('updates catch-up alone without replacing the task definition or state (enabled: %s)', async (enabled) => {
+    const { runtime, cleanup } = await createRuntime();
+    try {
+      const { task } = await runtime.upsertScheduledTask('project-test', {
+        name: 'Existing session check', enabled, targetSessionId: 'session-existing',
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        execution: { prompt: 'Keep this prompt', useDefaults: true },
+        state: { nextRunAt: 123456, lastScheduledFor: 100, lastStatus: 'sent' },
+      });
+      const updated = await runtime.upsertScheduledTask('project-test', { id: task.id, catchUpOnStartup: true });
+      expect(updated.task).toMatchObject({
+        name: task.name, enabled, targetSessionId: task.targetSessionId,
+        schedule: task.schedule, execution: task.execution, catchUpOnStartup: true,
+        state: { nextRunAt: 123456, lastScheduledFor: 100, lastStatus: 'sent' },
+      });
+      const cleared = await runtime.upsertScheduledTask('project-test', { id: task.id, catchUpOnStartup: false });
+      expect(cleared.task.catchUpOnStartup).toBeUndefined();
+      expect(cleared.task.enabled).toBe(enabled);
+      expect(cleared.task.targetSessionId).toBe(task.targetSessionId);
+      // Other partial writes retain their existing full-definition contract.
+      await expect(runtime.upsertScheduledTask('project-test', {
+        id: task.id, catchUpOnStartup: true, enabled: !enabled,
+      })).rejects.toThrow('task.name is required');
+    } finally { await cleanup(); }
+  });
+
+  it('defaults catch-up off and preserves an opted-in flag when older clients omit it', async () => {
+    const { runtime, tempRoot, cleanup } = await createRuntime();
+    const input = {
+      name: 'Daily check', enabled: true,
+      schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+      execution: { prompt: 'Check', useDefaults: true },
+    };
+    try {
+      const { task } = await runtime.upsertScheduledTask('project-test', input);
+      expect(task.catchUpOnStartup).toBeUndefined();
+      await runtime.upsertScheduledTask('project-test', { ...task, catchUpOnStartup: true });
+      await runtime.upsertScheduledTask('project-test', { ...input, id: task.id });
+      const reopened = createProjectConfigRuntime({ fsPromises: await import('fs/promises'), path, projectsDirPath: tempRoot });
+      expect((await reopened.listScheduledTasks('project-test'))[0].catchUpOnStartup).toBe(true);
+      await reopened.upsertScheduledTask('project-test', { ...input, id: task.id, catchUpOnStartup: false });
+      expect((await runtime.listScheduledTasks('project-test'))[0].catchUpOnStartup).toBeUndefined();
+    } finally { await cleanup(); }
+  });
+
+  it.each(['schedule', 'enabled'])('invalidates the persisted cursor after a %s change while retaining run history', async (field) => {
+    const { runtime, cleanup } = await createRuntime();
+    try {
+      const { task } = await runtime.upsertScheduledTask('project-test', {
+        name: 'Daily check', enabled: true, catchUpOnStartup: true,
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        execution: { prompt: 'Check', useDefaults: true },
+        state: { nextRunAt: 123456, lastScheduledFor: 100, lastStatus: 'sent' },
+      });
+      const unchanged = await runtime.upsertScheduledTask('project-test', { ...task, name: 'Renamed' });
+      expect(unchanged.task.state.nextRunAt).toBe(123456);
+      const changed = await runtime.upsertScheduledTask('project-test', {
+        ...unchanged.task,
+        ...(field === 'enabled' ? { enabled: false } : { schedule: { ...task.schedule, times: ['10:00'] } }),
+      });
+      expect(changed.task.state.nextRunAt).toBeUndefined();
+      expect(changed.task.state).toMatchObject({ lastScheduledFor: 100, lastStatus: 'sent' });
+      expect(changed.task.catchUpOnStartup).toBe(true);
+    } finally { await cleanup(); }
+  });
+
+  it('keeps the stored catch-up option when an atomic upsert fails', async () => {
+    const { runtime, tempRoot, cleanup } = await createRuntime();
+    try {
+      const { task } = await runtime.upsertScheduledTask('project-test', {
+        name: 'Daily check', catchUpOnStartup: true,
+        schedule: { kind: 'daily', time: '09:00', timezone: 'UTC' },
+        execution: { prompt: 'Check', useDefaults: true },
+      });
+      const fsPromises = await import('fs/promises');
+      const failing = createProjectConfigRuntime({
+        fsPromises: { ...fsPromises, rename: async () => { throw new Error('Synthetic write failure'); } },
+        path, projectsDirPath: tempRoot,
+      });
+      await expect(failing.upsertScheduledTask('project-test', { ...task, catchUpOnStartup: false })).rejects.toThrow('Synthetic write failure');
+      expect((await runtime.listScheduledTasks('project-test'))[0].catchUpOnStartup).toBe(true);
+    } finally { await cleanup(); }
+  });
+
   it.each([
     ['claim', 'stop'], ['claim', 'timeout'], ['discard', 'stop'],
     ['discard', 'timeout'], ['clear', 'stop'], ['clear', 'timeout'],
@@ -537,6 +621,33 @@ describe('project-config loop reconciliation', () => {
       },
       ...overrides,
     },
+  });
+
+  it('preserves machine-local catch-up across loop reconciliation and clears a changed schedule cursor', async () => {
+    const { runtime, cleanup } = await createRuntime();
+    // User loops require no project approval and exercise the same adoption path.
+    const definition = { ...loop('daily-check'), scope: 'user' };
+    try {
+      const [initial] = await runtime.reconcileLoopTasks('project-test', [definition]);
+      expect(initial.catchUpOnStartup).toBeUndefined();
+      await runtime.upsertScheduledTask('project-test', { ...initial, catchUpOnStartup: true });
+      await runtime.updateScheduledTaskState('project-test', initial.id, { nextRunAt: 123456, lastScheduledFor: 100 });
+      const [unchanged] = await runtime.reconcileLoopTasks('project-test', [definition]);
+      expect(unchanged.catchUpOnStartup).toBe(true);
+      expect(unchanged.state.nextRunAt).toBe(123456);
+      const [retimed] = await runtime.reconcileLoopTasks('project-test', [{
+        ...definition, definition: { ...definition.definition, schedule: { kind: 'cron', cron: '0 10 * * *', timezone: 'UTC' } },
+      }]);
+      expect(retimed.catchUpOnStartup).toBe(true);
+      expect(retimed.state.nextRunAt).toBeUndefined();
+      expect(retimed.state.lastScheduledFor).toBe(100);
+      await runtime.updateScheduledTaskState('project-test', initial.id, { nextRunAt: 234567 });
+      const [disabled] = await runtime.reconcileLoopTasks('project-test', [{
+        ...definition, definition: { ...definition.definition, enabled: false },
+      }]);
+      expect(disabled.state.nextRunAt).toBeUndefined();
+      expect(disabled.catchUpOnStartup).toBe(true);
+    } finally { await cleanup(); }
   });
 
   it('creates tasks for discovered loops with deterministic ids', async () => {

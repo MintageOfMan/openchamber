@@ -214,7 +214,9 @@ export const createScheduledTaskService = (dependencies) => {
       const invalid = message.toLowerCase().includes('required') || message.toLowerCase().includes('invalid');
       throw new OpenChamberControlError(message, invalid ? 400 : 500);
     }
-    if (previous?.targetSessionId && ((previous.enabled && upserted.task.enabled === false) || previous.targetSessionId !== upserted.task.targetSessionId)) {
+    // A catch-up-only patch changes no admission policy. A concurrent pause
+    // followed by Run now must not make this option cancel that manual prompt.
+    if (Object.hasOwn(taskInput, 'name') && previous?.targetSessionId && ((previous.enabled && upserted.task.enabled === false) || previous.targetSessionId !== upserted.task.targetSessionId)) {
       await scheduledTasksRuntime.cancelWaitingPrompt(id, taskInput.id);
     }
     await scheduledTasksRuntime.syncProject(id);

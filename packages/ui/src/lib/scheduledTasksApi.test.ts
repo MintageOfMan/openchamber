@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { z } from 'zod';
-import { fetchEligibleScheduledTaskTargets } from './scheduledTasksApi';
+import { fetchEligibleScheduledTaskTargets, upsertScheduledTask } from './scheduledTasksApi';
 
 const requestSchema = z.object({ candidates: z.array(z.object({ sessionId: z.string(), directory: z.string() })) });
+const catchUpUpdateSchema = z.strictObject({ task: z.strictObject({ id: z.string(), catchUpOnStartup: z.boolean() }) });
 
 const previousFetch = globalThis.fetch;
 
@@ -34,4 +35,17 @@ describe('fetchEligibleScheduledTaskTargets', () => {
     globalThis.fetch = Object.assign(async () => Response.json({ nope: true }), previousFetch);
     await expect(fetchEligibleScheduledTaskTargets('project-1', candidates(1))).rejects.toThrow();
   });
+});
+
+test('sends explicit catch-up opt-in and opt-out without replacing runtime state', async () => {
+  const values: boolean[] = [];
+  globalThis.fetch = Object.assign(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    const body = catchUpUpdateSchema.parse(JSON.parse(String(init?.body)));
+    expect(body.task.id).toBe('task-1');
+    values.push(body.task.catchUpOnStartup);
+    return Response.json({ tasks: [] });
+  }, previousFetch);
+  await upsertScheduledTask('project-1', { id: 'task-1', catchUpOnStartup: true });
+  await upsertScheduledTask('project-1', { id: 'task-1', catchUpOnStartup: false });
+  expect(values).toEqual([true, false]);
 });

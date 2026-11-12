@@ -9,6 +9,7 @@ export type ScheduledTaskDraft = {
   targetSessionId: string;
   name: string;
   enabled: boolean;
+  catchUpOnStartup: boolean;
   schedule: {
     kind: 'daily' | 'weekly' | 'once' | 'cron';
     times: string[];
@@ -69,6 +70,7 @@ export const toDraft = (
       sessionMode: 'new',
       targetSessionId: '',
       enabled: true,
+      catchUpOnStartup: false,
       schedule: {
         kind: 'daily',
         times: ['09:00'],
@@ -101,6 +103,7 @@ export const toDraft = (
     targetSessionId: task.targetSessionId || '',
     name: task.name,
     enabled: task.enabled,
+    catchUpOnStartup: task.catchUpOnStartup === true,
     schedule: {
       kind: task.schedule.kind === 'cron'
         ? 'cron'
@@ -198,6 +201,8 @@ export const buildScheduledTaskPayload = (draft: ScheduledTaskDraft): Partial<Sc
     name: draft.name.trim(),
     targetSessionId: draft.sessionMode === 'existing' ? draft.targetSessionId : '',
     enabled: draft.enabled,
+    // The task-card option also follows the task when this editor moves it.
+    catchUpOnStartup: draft.catchUpOnStartup,
     schedule: {
       kind: draft.schedule.kind,
       timezone: draft.schedule.timezone.trim(),

@@ -11,13 +11,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { stat } from 'node:fs/promises';
 import { readProcessInstance as readProcessInstanceDefault } from './process-instance.js';
 import { AUTO_MODEL_REF, isAutoModel } from '../routing/defaults.js';
+import { canClaimScheduledOccurrence, TASK_DUE_SLACK_MS } from './occurrence.js';
 
 const DEFAULT_GLOBAL_CONCURRENCY = 4;
 const DEFAULT_PROJECT_CONCURRENCY = 2;
 const DEFAULT_MAX_RUN_MS = 30 * 60 * 1000;
 const JITTER_MAX_MS = 2_000;
 const TASK_TITLE_MAX_LENGTH = 120;
-const TASK_DUE_SLACK_MS = 5_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const readDirectoryIdentity = async (directory) => {
   try {
@@ -267,6 +267,7 @@ export const createScheduledTasksRuntime = (deps) => {
     buildOpenCodeUrl,
     getOpenCodeAuthHeaders,
     waitForOpenCodeReady,
+    waitForOpenCodeStartup = waitForOpenCodeReady,
     emitTaskRunEvent,
     setSessionAutoAccept,
     sessionKnowledgeRuntime = null,
@@ -352,6 +353,7 @@ export const createScheduledTasksRuntime = (deps) => {
   const tasksByProject = new Map();
   const projectPathByID = new Map();
   const timersByTaskKey = new Map();
+  const startupCatchUps = new Map();
   const queuedTaskKeys = new Set();
   const runningTaskKeys = new Set();
   const runningCountByProject = new Map();
@@ -366,28 +368,40 @@ export const createScheduledTasksRuntime = (deps) => {
     }
   };
 
-  const clearProjectTimers = (projectID) => {
+  const clearProjectTimers = (projectID, nextTasks = new Map()) => {
     const tasks = tasksByProject.get(projectID);
     if (!tasks) {
       return;
     }
     for (const task of tasks.values()) {
-      clearTimerForKey(buildTaskKey(projectID, task.id));
-      queuedTaskKeys.delete(buildTaskKey(projectID, task.id));
+      const key = buildTaskKey(projectID, task.id);
+      const catchUp = startupCatchUps.get(key);
+      const nextTask = nextTasks.get(task.id);
+      if (catchUp && canClaimScheduledOccurrence(nextTask, catchUp.task, catchUp.scheduledFor, true)) continue;
+      catchUp?.cancel?.();
+      startupCatchUps.delete(key);
+      clearTimerForKey(key);
+      queuedTaskKeys.delete(key);
+      if (catchUp) {
+        for (let index = queue.length - 1; index >= 0; index -= 1) {
+          if (queue[index].catchUp === catchUp) queue.splice(index, 1);
+        }
+      }
     }
   };
 
   const setProjectTasks = (projectID, tasks) => {
-    clearProjectTimers(projectID);
     const taskMap = new Map();
     for (const task of tasks) {
       taskMap.set(task.id, task);
     }
+    clearProjectTimers(projectID, taskMap);
     tasksByProject.set(projectID, taskMap);
   };
 
-  const scheduleTask = (projectID, taskID, nextRunAt) => {
+  const scheduleTask = (projectID, taskID, nextRunAt, catchUp) => {
     const taskKey = buildTaskKey(projectID, taskID);
+    if (startupCatchUps.has(taskKey) && startupCatchUps.get(taskKey) !== catchUp) return;
     clearTimerForKey(taskKey);
 
     if (!started) {
@@ -405,7 +419,7 @@ export const createScheduledTasksRuntime = (deps) => {
 
     const timer = setTimeout(async () => {
       if (delay > MAX_TIMER_DELAY_MS) {
-        scheduleTask(projectID, taskID, nextRunAt);
+        scheduleTask(projectID, taskID, nextRunAt, catchUp);
         return;
       }
 
@@ -415,7 +429,11 @@ export const createScheduledTasksRuntime = (deps) => {
       if (!task || !task.enabled) {
         return;
       }
-      queueTaskRun(projectID, taskID, 'scheduled', nextRunAt);
+      const queued = queueTaskRun(projectID, taskID, 'scheduled', nextRunAt, catchUp);
+      if (!queued && catchUp) {
+        startupCatchUps.delete(taskKey);
+        rearmFromTaskOrCompute(projectID, taskID, task);
+      }
       pumpQueue();
     }, boundedDelay);
 
@@ -479,7 +497,7 @@ export const createScheduledTasksRuntime = (deps) => {
     return null;
   };
 
-  const syncProject = async (projectID) => {
+  const syncProject = async (projectID, { startup = false } = {}) => {
     await ensureProjectPath(projectID);
     const projectPath = projectPathByID.get(projectID) || null;
 
@@ -499,13 +517,23 @@ export const createScheduledTasksRuntime = (deps) => {
     setProjectTasks(projectID, tasks);
 
     for (const task of tasks) {
+      const key = buildTaskKey(projectID, task.id);
+      if (startupCatchUps.has(key)) continue;
+      const scheduledFor = task.state?.nextRunAt;
+      if (startup && scheduledFor > 0 && scheduledFor < Date.now()
+        && canClaimScheduledOccurrence(task, task, scheduledFor, true)) {
+        const catchUp = { task, scheduledFor };
+        startupCatchUps.set(key, catchUp);
+        scheduleTask(projectID, task.id, scheduledFor, catchUp);
+        continue;
+      }
       await syncTaskSchedule(projectID, task);
     }
 
     return tasks;
   };
 
-  const syncAllProjects = async () => {
+  const syncAllProjects = async ({ startup = false } = {}) => {
     const projects = await listScopes();
     const activeProjectIDs = new Set();
     projectPathByID.clear();
@@ -526,7 +554,7 @@ export const createScheduledTasksRuntime = (deps) => {
 
     for (const projectID of activeProjectIDs) {
       try {
-        await syncProject(projectID);
+        await syncProject(projectID, { startup });
       } catch (error) {
         // One project's config being unusable (a broken file, a lock timeout)
         // must not keep every other project's tasks from being scheduled.
@@ -538,18 +566,20 @@ export const createScheduledTasksRuntime = (deps) => {
     }
   };
 
-  const queueTaskRun = (projectID, taskID, reason, scheduledFor) => {
+  const queueTaskRun = (projectID, taskID, reason, scheduledFor, catchUp) => {
     const taskKey = buildTaskKey(projectID, taskID);
     if (queuedTaskKeys.has(taskKey) || runningTaskKeys.has(taskKey)) {
-      return;
+      return false;
     }
     queuedTaskKeys.add(taskKey);
     queue.push({
       projectID,
       taskID,
       reason,
+      catchUp,
       ...(Number.isFinite(scheduledFor) ? { scheduledFor } : {}),
     });
+    return true;
   };
 
   const canRunTask = (projectID) => {
@@ -967,9 +997,34 @@ export const createScheduledTasksRuntime = (deps) => {
     scheduleFutureRun(projectID, taskID, computedNext, base);
   };
 
-  const runTask = async (projectID, taskID, reason, scheduledFor) => {
+  const runTask = async (projectID, taskID, reason, scheduledFor, catchUp) => {
+    const taskKey = buildTaskKey(projectID, taskID);
+    let startupError;
+    if (catchUp) {
+      if (startupCatchUps.get(taskKey) !== catchUp) return { ok: false, skipped: true };
+      // Bootstrap starts before the scheduler but may not have a port yet.
+      // Wait before claiming, including for existing-session admissions.
+      runningTaskKeys.add(taskKey);
+      runningGlobalCount += 1;
+      runningCountByProject.set(projectID, (runningCountByProject.get(projectID) || 0) + 1);
+      // Cancellation ends this wait without stopping shared backend startup.
+      // Its own finally releases the slot before replacement work can run.
+      const cancelled = new Promise((resolve) => { catchUp.cancel = resolve; });
+      try {
+        await Promise.race([waitForOpenCodeStartup?.(), cancelled]);
+      } catch (error) {
+        // Record this attempt through the ordinary claim and failure path.
+        // Once tasks are consumed there, and recurring tasks rearm in future.
+        startupError = new Error(`OpenCode startup readiness failed: ${safeErrorMessage(error)}`);
+      } finally {
+        delete catchUp.cancel;
+        releaseRunningSlot(projectID, taskKey);
+      }
+      if (!started || startupCatchUps.get(taskKey) !== catchUp) return { ok: false, skipped: true };
+      startupCatchUps.delete(taskKey);
+    }
     const taskMap = tasksByProject.get(projectID);
-    const task = taskMap?.get(taskID);
+    let task = taskMap?.get(taskID);
     // Manual runNow runs paused tasks too; only scheduled dispatches skip them.
     if (!task || (reason !== 'manual' && !task.enabled)) {
       return { ok: false, skipped: true };
@@ -978,7 +1033,8 @@ export const createScheduledTasksRuntime = (deps) => {
     if (task.targetSessionId) {
       if (!existingSessionTasks) return { ok: false, error: 'Existing-session scheduling is unavailable', statusCode: 503 };
       const nextRunAt = computeNextRunAt(task, Math.max(Date.now(), (scheduledFor ?? 0) + 1));
-      const result = await existingSessionTasks.run(projectID, task, reason, scheduledFor, nextRunAt);
+      const result = await existingSessionTasks.run(projectID, task, reason, scheduledFor, nextRunAt, Boolean(catchUp), startupError);
+      if (result.task) updateInMemoryTask(projectID, result.task);
       if (reason === 'scheduled') {
         if (task.schedule.kind === 'once' && result.task && !result.skipped) {
           try {
@@ -991,12 +1047,12 @@ export const createScheduledTasksRuntime = (deps) => {
               error: safeErrorMessage(consumeError),
             });
           }
-        } else scheduleFutureRun(projectID, taskID, nextRunAt);
+        } else if (result.skipped) rearmFromTaskOrCompute(projectID, taskID, result.task || task);
+        else scheduleFutureRun(projectID, taskID, nextRunAt);
       }
       return result;
     }
 
-    const taskKey = buildTaskKey(projectID, taskID);
     if (runningTaskKeys.has(taskKey)) {
       return { ok: false, running: true };
     }
@@ -1033,23 +1089,9 @@ export const createScheduledTasksRuntime = (deps) => {
           nextRunAt: Number.isFinite(nextAfterClaim) ? nextAfterClaim : undefined,
         };
 
-        // Duplicate protection is solely lastScheduledFor within slack of this
-        // occurrence. Do not reject on advanced disk nextRunAt: lastScheduledFor
-        // persists across days, so a second-instance sync inside TASK_DUE_SLACK_MS
-        // would otherwise suppress every armed occurrence after the first.
-        const canClaimOccurrence = (candidate) => {
-          if (!candidate?.enabled) {
-            return false;
-          }
-          const lastScheduledFor = candidate.state?.lastScheduledFor;
-          if (
-            Number.isFinite(lastScheduledFor)
-            && Math.abs(lastScheduledFor - scheduledFor) <= TASK_DUE_SLACK_MS
-          ) {
-            return false;
-          }
-          return true;
-        };
+        const canClaimOccurrence = (candidate) => canClaimScheduledOccurrence(
+          candidate, catchUp?.task || task, scheduledFor, Boolean(catchUp),
+        );
 
         let claimResult;
         try {
@@ -1086,16 +1128,7 @@ export const createScheduledTasksRuntime = (deps) => {
               const recorded = await projectConfigRuntime.updateScheduledTaskStateIf(
                 projectID,
                 taskID,
-                (candidate) => {
-                  const lastScheduledFor = candidate.state?.lastScheduledFor;
-                  if (
-                    Number.isFinite(lastScheduledFor)
-                    && Math.abs(lastScheduledFor - scheduledFor) <= TASK_DUE_SLACK_MS
-                  ) {
-                    return false;
-                  }
-                  return true;
-                },
+                canClaimOccurrence,
                 claimFailurePatch,
               );
               if (recorded.task) {
@@ -1139,6 +1172,7 @@ export const createScheduledTasksRuntime = (deps) => {
         }
 
         if (claimResult.task) {
+          task = claimResult.task;
           updateInMemoryTask(projectID, claimResult.task);
         }
       } else {
@@ -1203,6 +1237,7 @@ export const createScheduledTasksRuntime = (deps) => {
       };
 
       try {
+        if (startupError) throw startupError;
         const runPromise = runTaskWithWatchdog(projectID, task, reason, recordCreatedSession);
         let timeoutID;
         const timeoutPromise = new Promise((_, reject) => {
@@ -1401,7 +1436,7 @@ export const createScheduledTasksRuntime = (deps) => {
       queuedTaskKeys.delete(taskKey);
       consumed = true;
 
-      void runTask(item.projectID, item.taskID, item.reason, item.scheduledFor)
+      void runTask(item.projectID, item.taskID, item.reason, item.scheduledFor, item.catchUp)
         .catch((error) => {
           logger.warn?.('[ScheduledTasks] queued run rejected', {
             projectID: item.projectID,
@@ -1437,7 +1472,8 @@ export const createScheduledTasksRuntime = (deps) => {
       };
     }
 
-    return runTask(projectID, taskID, 'manual');
+    // A manual run may be the concurrency slot a scheduled recovery awaits.
+    return runTask(projectID, taskID, 'manual').finally(pumpQueue);
   };
 
   const start = async () => {
@@ -1452,7 +1488,7 @@ export const createScheduledTasksRuntime = (deps) => {
       logger.warn?.('[ScheduledTasks] failed to resume worktree cleanup', error?.message ?? error);
     }
     // Snapshot recovery before sync can start any newly due task.
-    await syncAllProjects();
+    await syncAllProjects({ startup: true });
     const owners = new Map();
     for (const record of cleanups) {
       if (record.ownerPID > 0 && record.ownerPID !== process.pid && record.ownerInstance) {
@@ -1486,6 +1522,8 @@ export const createScheduledTasksRuntime = (deps) => {
       clearTimeout(timer);
     }
     timersByTaskKey.clear();
+    for (const catchUp of startupCatchUps.values()) catchUp.cancel?.();
+    startupCatchUps.clear();
     queuedTaskKeys.clear();
     queue.length = 0;
   };

@@ -2029,6 +2029,10 @@ const scheduledTasksRuntime = createScheduledTasksRuntime({
   buildOpenCodeUrl,
   getOpenCodeAuthHeaders,
   waitForOpenCodeReady,
+  waitForOpenCodeStartup: async () => {
+    await waitForOpenCodePort();
+    await waitForOpenCodeReady();
+  },
   sessionKnowledgeRuntime,
   persistSessionGoal: (sessionID, directory, goal) =>
     persistSessionMetadataPatch(sessionID, { openchamber: { goal } }, { directory }),

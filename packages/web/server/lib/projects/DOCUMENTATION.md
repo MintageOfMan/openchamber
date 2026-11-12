@@ -125,6 +125,12 @@ would lose an intervening append. A malformed registry fails without repair.
 
 ## Invariants
 
+- Scheduled tasks store the optional `catchUpOnStartup` boolean locally. Omission
+  on upsert preserves the stored choice; a new task defaults off. Loop adoption
+  preserves this field without adding it to portable frontmatter. A schedule or
+  enabled-state change clears the previous `nextRunAt`, including during loop
+  reconciliation, while retaining run history. Startup recovery is owned by
+  `../scheduled-tasks/DOCUMENTATION.md`.
 - Scheduled worktree cleanup records are keyed by session id and survive task deletion. Each captures the created branch and directory identity. Scanning the project config files recovers runs even when their project is no longer registered; an unreadable file or malformed record does not erase other records. Claims and journal changes use the project lock, but Git removal runs outside it. A `removing` record carries both `ownerPID` and the native `ownerInstance` creation fingerprint until completion; PID reuse does not retain ownership. Failure releases ownership and a dead instance can be reclaimed. Unreadable process identity fails closed. Successful cleanup clears only that run's record. See `../scheduled-tasks/DOCUMENTATION.md` for the execution, goal and background-command gates.
 - Cleanup finalization accepts an abort signal and checks it after acquiring the project lock, after awaited claim checks, and before clearing the journal. An aborted claimed operation releases ownership without discarding the record; that release is allowed to finish after cancellation.
 

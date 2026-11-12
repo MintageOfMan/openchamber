@@ -45,6 +45,105 @@ const setup = (overrides = {}) => {
 };
 
 describe('existing session scheduling', () => {
+  it.each(['daily', 'once'])('records a %s startup readiness failure without admitting a prompt', async (kind) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T12:00:00Z'));
+    const { projectConfigRuntime, messageQueueRuntime, stored } = setup();
+    const missed = Date.parse('2026-01-01T09:00:00Z');
+    const schedule = kind === 'once'
+      ? { kind, date: '2026-01-01', time: '09:00', timezone: 'UTC' }
+      : { kind, time: '09:00', timezone: 'UTC' };
+    await projectConfigRuntime.upsertScheduledTask('project-1', {
+      ...task, catchUpOnStartup: true, schedule, state: { nextRunAt: missed },
+    });
+    const fetchImpl = vi.fn();
+    vi.stubGlobal('fetch', fetchImpl);
+    const scheduler = createScheduledTasksRuntime({
+      projectConfigRuntime, messageQueueRuntime,
+      listProjects: async () => [{ id: 'project-1', path: '/repo' }],
+      chatsScope: { id: 'project-1', root: '/repo', contains: () => true },
+      buildOpenCodeUrl: (route) => `http://opencode.test${route}`, getOpenCodeAuthHeaders: () => ({}),
+      waitForOpenCodeStartup: async () => { throw new Error('Synthetic readiness failure'); },
+    });
+    try {
+      await scheduler.start();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(messageQueueRuntime.enqueue).not.toHaveBeenCalled();
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stored().state).toMatchObject({
+        lastScheduledFor: missed,
+        lastStatus: 'failed',
+        lastError: 'OpenCode startup readiness failed: Synthetic readiness failure',
+      });
+      expect(stored().enabled).toBe(kind !== 'once');
+      if (kind === 'once') expect(stored().state.nextRunAt).toBeUndefined();
+      else expect(stored().state.nextRunAt).toBeGreaterThan(Date.now());
+      expect(scheduler.getStatus().runningScheduledTasksCount).toBe(0);
+    } finally { scheduler.stop(); }
+  });
+
+  it.each([false, true])('recovers and consumes an existing-session once task when admission fails=%s', async (fails) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T12:00:00Z'));
+    const { projectConfigRuntime, messageQueueRuntime, stored } = setup();
+    const missed = Date.parse('2026-01-01T09:00:00Z');
+    await projectConfigRuntime.upsertScheduledTask('project-1', {
+      ...task, catchUpOnStartup: true,
+      schedule: { kind: 'once', date: '2026-01-01', time: '09:00', timezone: 'UTC' },
+      state: { nextRunAt: missed },
+    });
+    if (fails) messageQueueRuntime.enqueue.mockRejectedValue(new Error('Synthetic admission failure'));
+    vi.stubGlobal('fetch', async () => Response.json({ data: { id: 'ses_target', location: { directory: '/repo' } } }));
+    const deps = {
+      projectConfigRuntime, messageQueueRuntime,
+      listProjects: async () => [{ id: 'project-1', path: '/repo' }],
+      chatsScope: { id: 'project-1', root: '/repo', contains: () => true },
+      buildOpenCodeUrl: (route) => `http://opencode.test${route}`, getOpenCodeAuthHeaders: () => ({}),
+      waitForOpenCodeStartup: async () => {},
+    };
+    const first = createScheduledTasksRuntime(deps);
+    const second = createScheduledTasksRuntime(deps);
+    try {
+      await first.start();
+      await second.start();
+      await first.syncProject('project-1');
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(messageQueueRuntime.enqueue).toHaveBeenCalledOnce();
+      expect(stored().enabled).toBe(false);
+      expect(stored().state.lastScheduledFor).toBe(missed);
+      expect(stored().state.lastStatus).toBe(fails ? 'failed' : 'queued');
+      expect(stored().state.nextRunAt).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(messageQueueRuntime.enqueue).toHaveBeenCalledOnce();
+    } finally { first.stop(); second.stop(); }
+  });
+
+  it('claims a recovered occurrence once across existing-session admissions', async () => {
+    const { runtime, projectConfigRuntime, messageQueueRuntime } = setup();
+    const missed = Date.now() - 60_000;
+    const saved = await projectConfigRuntime.upsertScheduledTask('project-1', {
+      ...task, catchUpOnStartup: true, state: { nextRunAt: missed },
+    });
+    expect(await runtime.run('project-1', saved.task, 'scheduled', missed, null, true)).toMatchObject({ ok: true });
+    expect(await runtime.run('project-1', saved.task, 'scheduled', missed, null, true)).toMatchObject({ skipped: true });
+    expect(messageQueueRuntime.enqueue).toHaveBeenCalledOnce();
+    expect((await projectConfigRuntime.listScheduledTasks())[0].state.nextRunAt).toBeUndefined();
+  });
+
+  it.each(['withdrawn', 'disabled', 'retimed', 'newer-claim'])('rejects a recovered existing-session occurrence after %s', async (change) => {
+    const { runtime, projectConfigRuntime, messageQueueRuntime } = setup();
+    const missed = Date.now() - 60_000;
+    const original = { ...task, catchUpOnStartup: true, state: { nextRunAt: missed } };
+    const current = structuredClone(original);
+    if (change === 'withdrawn') current.catchUpOnStartup = false;
+    if (change === 'disabled') current.enabled = false;
+    if (change === 'retimed') current.schedule.time = '10:00';
+    if (change === 'newer-claim') current.state.lastScheduledFor = missed + 10_000;
+    await projectConfigRuntime.upsertScheduledTask('project-1', current);
+    expect(await runtime.run('project-1', original, 'scheduled', missed, null, true)).toMatchObject({ skipped: true });
+    expect(messageQueueRuntime.enqueue).not.toHaveBeenCalled();
+  });
+
   it('the scheduler reuses a target without creating a chat or reading new-session defaults', async () => {
     const { projectConfigRuntime, messageQueueRuntime } = setup();
     const fetchImpl = vi.fn(async () => Response.json({ location: { directory: '/repo' }, data: { id: 'ses_target', location: { directory: '/repo' } } }));

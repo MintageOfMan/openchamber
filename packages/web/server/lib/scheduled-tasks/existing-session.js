@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { OpenChamberControlError } from '../openchamber-control/error.js';
 import { asNonEmptyString } from '../shared/guards.js';
 import { expandSnippets } from '../opencode/snippets.js';
+import { canClaimScheduledOccurrence } from './occurrence.js';
 
 export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueRuntime, createClient, listProjects, chatsScope, resolvePrimaryWorktreeRoot, isSessionArchived, emitTaskRunEvent }) => {
   const admissions = new Set();
@@ -94,7 +95,7 @@ export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueR
     return result.task;
   };
 
-  const run = async (projectId, task, reason, scheduledFor, nextRunAt) => {
+  const run = async (projectId, task, reason, scheduledFor, nextRunAt, catchUp = false, startupError) => {
     const triggeredAt = Date.now();
     const key = `${projectId}:${task.id}`;
     if (admissions.has(key)) {
@@ -110,10 +111,12 @@ export const createExistingSessionTasks = ({ projectConfigRuntime, messageQueueR
     try {
       if (reason === 'scheduled') {
         const claim = await projectConfigRuntime.updateScheduledTaskStateIf(projectId, task.id,
-          (candidate) => candidate.enabled && (!Number.isFinite(candidate.state?.lastScheduledFor) || Math.abs(candidate.state.lastScheduledFor - scheduledFor) > 5_000),
+          (candidate) => canClaimScheduledOccurrence(candidate, task, scheduledFor, catchUp),
           { lastScheduledFor: scheduledFor, nextRunAt: nextRunAt ?? undefined });
-        if (!claim.updated) return { ok: false, skipped: true };
+        if (!claim.updated) return { ok: false, skipped: true, task: claim.task };
+        task = claim.task;
       }
+      if (startupError) throw startupError;
       const { directory } = await validateTarget(projectId, task.targetSessionId);
       const sendConfig = task.execution.useDefaults ? {} : {
         providerID: task.execution.providerID, modelID: task.execution.modelID,

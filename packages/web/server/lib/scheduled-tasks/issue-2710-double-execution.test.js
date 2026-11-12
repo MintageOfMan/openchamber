@@ -15,6 +15,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
  */
 
 import { createScheduledTasksRuntime } from './runtime.js';
+import { canClaimScheduledOccurrence } from './occurrence.js';
 
 const opencode = { sessionCreates: [] };
 
@@ -161,6 +162,348 @@ describe('issue 2710: daily scheduled task double execution at the configured ti
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    { kind: 'daily', times: ['09:00'] },
+    { kind: 'weekly', times: ['09:00'], weekdays: [4] },
+    { kind: 'cron', cron: '0 9 * * *' },
+    { kind: 'once', date: '2026-01-01', time: '09:00' },
+  ])('recovers one persisted $kind occurrence, then only future runs', async (schedule) => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const missed = UTC(2026, 0, 1, 9, 0);
+    const task = { ...makeTask(schedule), catchUpOnStartup: true };
+    task.state.nextRunAt = missed;
+    const { runtimes, projectConfigRuntime } = await startInstances(1, task);
+    try {
+      // Listing or saving while the startup timer waits keeps that one recovery.
+      await runtimes[0].syncProject('p1');
+      await runtimes[0].syncAllProjects();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(opencode.sessionCreates).toHaveLength(1);
+      const [stored] = await projectConfigRuntime.listScheduledTasks('p1');
+      expect(stored.state.lastScheduledFor).toBe(missed);
+      if (schedule.kind === 'once') {
+        expect(stored.enabled).toBe(false);
+        expect(stored.state.nextRunAt).toBeUndefined();
+      } else {
+        expect(stored.state.nextRunAt).toBeGreaterThan(Date.now());
+      }
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(opencode.sessionCreates).toHaveLength(1);
+      if (schedule.kind !== 'once') {
+        await vi.advanceTimersByTimeAsync(stored.state.nextRunAt - Date.now() + 3_000);
+        expect(opencode.sessionCreates).toHaveLength(2);
+      } else {
+        runtimes[0].stop();
+        await runtimes[0].start();
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(opencode.sessionCreates).toHaveLength(1);
+      }
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
+  });
+
+  it.each(['missing-option', 'option-false', 'invalid-option', 'disabled', 'missing-cursor', 'invalid-cursor', 'current-cursor', 'future-cursor', 'already-claimed'])('does not recover %s', async (condition) => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const missed = UTC(2026, 0, 1, 9, 0);
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = missed;
+    if (condition === 'missing-option') delete task.catchUpOnStartup;
+    if (condition === 'option-false') task.catchUpOnStartup = false;
+    if (condition === 'invalid-option') task.catchUpOnStartup = 'true';
+    if (condition === 'disabled') task.enabled = false;
+    if (condition === 'missing-cursor') delete task.state.nextRunAt;
+    if (condition === 'invalid-cursor') task.state.nextRunAt = NaN;
+    if (condition === 'current-cursor') task.state.nextRunAt = Date.now();
+    if (condition === 'future-cursor') task.state.nextRunAt = Date.now() + HOUR;
+    if (condition === 'already-claimed') task.state.lastScheduledFor = missed;
+    const { runtimes } = await startInstances(1, task);
+    try {
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(opencode.sessionCreates).toHaveLength(0);
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
+  });
+
+  it('ordinary sync never discovers a missed occurrence', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    const { runtimes, projectConfigRuntime } = await startInstances(1, task);
+    try {
+      await projectConfigRuntime.updateScheduledTaskState('p1', task.id, { nextRunAt: Date.now() - HOUR });
+      await runtimes[0].syncProject('p1');
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(opencode.sessionCreates).toHaveLength(0);
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
+  });
+
+  it('two startup recoveries sharing a cursor dispatch once', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const { runtimes, projectConfigRuntime } = await startInstances(2, task);
+    try {
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(opencode.sessionCreates).toHaveLength(1);
+      const [stored] = await projectConfigRuntime.listScheduledTasks('p1');
+      expect(stored.state.lastScheduledFor).toBe(task.state.nextRunAt);
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
+  });
+
+  it.each(['disabled', 'retimed', 'withdrawn', 'newer-claim'])('rejects startup recovery after %s at the locked claim', async (change) => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const { runtimes, projectConfigRuntime } = await startInstances(1, task);
+    try {
+      const changed = structuredClone(task);
+      if (change === 'disabled') changed.enabled = false;
+      if (change === 'retimed') changed.schedule.times = ['14:00'];
+      if (change === 'withdrawn') changed.catchUpOnStartup = false;
+      if (change === 'newer-claim') changed.state.lastScheduledFor = Date.now();
+      await projectConfigRuntime.upsertScheduledTask('p1', changed);
+      // Deliberately no sync: another process changed the shared file.
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(opencode.sessionCreates).toHaveLength(0);
+      expect((await projectConfigRuntime.listScheduledTasks('p1'))[0].state.lastScheduledFor)
+        .toBe(changed.state.lastScheduledFor);
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
+  });
+
+  it.each(['disabled', 'retimed', 'withdrawn'])('cancels a pending startup recovery on %s sync', async (change) => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const { runtimes, projectConfigRuntime } = await startInstances(1, task);
+    try {
+      if (change === 'disabled') task.enabled = false;
+      if (change === 'retimed') task.schedule.times = ['14:00'];
+      if (change === 'withdrawn') task.catchUpOnStartup = false;
+      await projectConfigRuntime.upsertScheduledTask('p1', task);
+      await runtimes[0].syncProject('p1');
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(opencode.sessionCreates).toHaveLength(0);
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
+  });
+
+  it('waits for startup readiness before claiming and keeps the manual queue guard', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const projectConfigRuntime = createSharedProjectConfigRuntime(task);
+    const ready = Promise.withResolvers();
+    const runtime = createScheduledTasksRuntime({ ...createRuntimeDeps(projectConfigRuntime), waitForOpenCodeStartup: () => ready.promise });
+    try {
+      await runtime.start();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await runtime.syncProject('p1');
+      expect(projectConfigRuntime.updateScheduledTaskStateIf).not.toHaveBeenCalled();
+      expect(await runtime.runNow('p1', task.id)).toMatchObject({ running: true });
+      ready.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(opencode.sessionCreates).toHaveLength(1);
+    } finally { ready.resolve(); runtime.stop(); }
+  });
+
+  it('cancels a recovery disabled while startup readiness is pending', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const projectConfigRuntime = createSharedProjectConfigRuntime(task);
+    const ready = Promise.withResolvers();
+    const runtime = createScheduledTasksRuntime({ ...createRuntimeDeps(projectConfigRuntime), waitForOpenCodeStartup: () => ready.promise });
+    try {
+      await runtime.start();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await projectConfigRuntime.upsertScheduledTask('p1', { ...task, enabled: false });
+      await runtime.syncProject('p1');
+      ready.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(projectConfigRuntime.updateScheduledTaskStateIf).not.toHaveBeenCalled();
+      expect(opencode.sessionCreates).toHaveLength(0);
+      expect(runtime.getStatus().runningScheduledTasksCount).toBe(0);
+    } finally { ready.resolve(); runtime.stop(); }
+  });
+
+  it.each(['opt-out', 'retime'])('keeps normal occurrences runnable after %s cancels a readiness wait', async (change) => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0, 50));
+    const schedule = change === 'retime'
+      ? { kind: 'daily', times: ['09:00'] }
+      : { kind: 'cron', cron: '* * * * *' };
+    const task = { ...makeTask(schedule), catchUpOnStartup: true };
+    task.state.nextRunAt = UTC(2026, 0, 1, 9, 0);
+    const projectConfigRuntime = createSharedProjectConfigRuntime(task);
+    const ready = Promise.withResolvers();
+    const runtime = createScheduledTasksRuntime({ ...createRuntimeDeps(projectConfigRuntime), waitForOpenCodeStartup: () => ready.promise });
+    try {
+      await runtime.start();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(runtime.getStatus().runningScheduledTasksCount).toBe(1);
+      if (change === 'opt-out') task.catchUpOnStartup = false;
+      else task.schedule.times = ['12:01'];
+      await projectConfigRuntime.upsertScheduledTask('p1', task);
+      await runtime.syncProject('p1');
+      expect(runtime.getStatus().runningScheduledTasksCount).toBe(0);
+      // The replacement becomes due while the cancelled wait is unresolved.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(opencode.sessionCreates).toHaveLength(1);
+      ready.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(opencode.sessionCreates).toHaveLength(1);
+      const [stored] = await projectConfigRuntime.listScheduledTasks('p1');
+      expect(stored.state.lastScheduledFor).toBe(UTC(2026, 0, 1, 12, 1));
+      await vi.advanceTimersByTimeAsync(stored.state.nextRunAt - Date.now() + 3_000);
+      expect(opencode.sessionCreates).toHaveLength(2);
+    } finally { ready.resolve(); runtime.stop(); }
+  });
+
+  it('a cancelled startup wait cannot release a replacement manual run slot', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const projectConfigRuntime = createSharedProjectConfigRuntime(task);
+    const ready = Promise.withResolvers();
+    const dispatch = Promise.withResolvers();
+    const runtime = createScheduledTasksRuntime({ ...createRuntimeDeps(projectConfigRuntime), waitForOpenCodeStartup: () => ready.promise });
+    let manual;
+    try {
+      await runtime.start();
+      await vi.advanceTimersByTimeAsync(3_000);
+      await projectConfigRuntime.upsertScheduledTask('p1', { ...task, catchUpOnStartup: false });
+      await runtime.syncProject('p1');
+      installOpenCodeFetch(dispatch.promise);
+      manual = runtime.runNow('p1', task.id);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(opencode.sessionCreates).toHaveLength(1);
+      ready.resolve();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(runtime.getStatus().runningScheduledTasksCount).toBe(1);
+      expect(await runtime.runNow('p1', task.id)).toMatchObject({ running: true });
+    } finally {
+      ready.resolve();
+      dispatch.resolve();
+      await manual;
+      runtime.stop();
+    }
+  });
+
+  it.each(['daily', 'once'])('records a %s startup readiness failure and releases the slot without dispatch or retry', async (kind) => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const schedule = kind === 'once'
+      ? { kind, date: '2026-01-01', time: '09:00' }
+      : { kind, times: ['09:00'] };
+    const task = { ...makeTask(schedule), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const projectConfigRuntime = createSharedProjectConfigRuntime(task);
+    const runtime = createScheduledTasksRuntime({
+      ...createRuntimeDeps(projectConfigRuntime),
+      waitForOpenCodeStartup: async () => { throw new Error('Synthetic readiness failure'); },
+    });
+    try {
+      await runtime.start();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(projectConfigRuntime.updateScheduledTaskStateIf).toHaveBeenCalledOnce();
+      expect(opencode.sessionCreates).toHaveLength(0);
+      expect(runtime.getStatus().runningScheduledTasksCount).toBe(0);
+      const [stored] = await projectConfigRuntime.listScheduledTasks('p1');
+      expect(stored.state).toMatchObject({
+        lastScheduledFor: task.state.nextRunAt,
+        lastStatus: 'error',
+        lastError: 'OpenCode startup readiness failed: Synthetic readiness failure',
+      });
+      expect(stored.enabled).toBe(kind !== 'once');
+      if (kind === 'once') expect(stored.state.nextRunAt).toBeUndefined();
+      else expect(stored.state.nextRunAt).toBeGreaterThan(Date.now());
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(projectConfigRuntime.updateScheduledTaskStateIf).toHaveBeenCalledOnce();
+      expect(await runtime.runNow('p1', task.id)).toMatchObject({ ok: true });
+    } finally { runtime.stop(); }
+  });
+
+  it.each([
+    [-5_001, true], [-5_000, false], [0, false], [5_000, false], [5_001, true],
+  ])('keeps the ordinary absolute duplicate window at offset %s', (offset, expected) => {
+    const task = makeTask({ kind: 'daily', times: ['09:00'] });
+    const candidate = {
+      ...task, catchUpOnStartup: false,
+      schedule: { kind: 'daily', times: ['10:00'], timezone: 'UTC' },
+      state: { lastScheduledFor: 100_000 + offset },
+    };
+    expect(canClaimScheduledOccurrence(candidate, task, 100_000)).toBe(expected);
+    expect(canClaimScheduledOccurrence(candidate, task, 100_000, true)).toBe(false);
+  });
+
+  it('rejects a newer claim only for catch-up, even outside the duplicate window', () => {
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    const candidate = { ...task, state: { lastScheduledFor: 110_000 } };
+    expect(canClaimScheduledOccurrence(candidate, task, 100_000)).toBe(true);
+    expect(canClaimScheduledOccurrence(candidate, task, 100_000, true)).toBe(false);
+  });
+
+  it('does not overwrite a newer winner when startup readiness fails', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const projectConfigRuntime = createSharedProjectConfigRuntime(task);
+    const ready = Promise.withResolvers();
+    const runtime = createScheduledTasksRuntime({ ...createRuntimeDeps(projectConfigRuntime), waitForOpenCodeStartup: () => ready.promise });
+    try {
+      await runtime.start();
+      await vi.advanceTimersByTimeAsync(3_000);
+      const winner = { lastScheduledFor: Date.now(), lastStatus: 'sent', lastSessionId: 'winner-session' };
+      await projectConfigRuntime.updateScheduledTaskState('p1', task.id, winner);
+      ready.reject(new Error('Synthetic readiness failure'));
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await projectConfigRuntime.listScheduledTasks('p1'))[0].state).toMatchObject(winner);
+      expect(opencode.sessionCreates).toHaveLength(0);
+      expect(runtime.getStatus().runningScheduledTasksCount).toBe(0);
+    } finally { ready.resolve(); runtime.stop(); }
+  });
+
+  it('preserves a startup recovery waiting behind another task in the concurrency queue', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'daily', times: ['09:00'] }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    const recovering = createSharedProjectConfigRuntime(task);
+    const blocker = createSharedProjectConfigRuntime({ ...makeTask({ kind: 'daily', times: ['09:00'] }), id: 'blocker' });
+    const select = (id) => id === 'p1' ? recovering : blocker;
+    const projectConfigRuntime = Object.fromEntries([
+      'listScheduledTasks', 'reconcileLoopTasks', 'updateScheduledTaskState', 'updateScheduledTaskStateIf', 'upsertScheduledTask',
+    ].map((name) => [name, (id, ...args) => select(id)[name](id, ...args)]));
+    const gate = Promise.withResolvers();
+    installOpenCodeFetch(gate.promise);
+    const runtime = createScheduledTasksRuntime({
+      ...createRuntimeDeps(projectConfigRuntime), maxGlobalConcurrency: 1,
+      listProjects: async () => [{ id: 'p1', path: '/repo' }, { id: 'p2', path: '/other' }],
+    });
+    let manual;
+    try {
+      await runtime.start();
+      manual = runtime.runNow('p2', 'blocker');
+      await vi.advanceTimersByTimeAsync(3_000);
+      await runtime.syncProject('p1');
+      expect(recovering.updateScheduledTaskStateIf).not.toHaveBeenCalled();
+      expect(await runtime.runNow('p1', task.id)).toMatchObject({ queued: true });
+      gate.resolve();
+      await manual;
+      await vi.advanceTimersByTimeAsync(1);
+      expect(opencode.sessionCreates).toHaveLength(2);
+      expect((await recovering.listScheduledTasks('p1'))[0].state.lastScheduledFor).toBe(task.state.nextRunAt);
+    } finally { gate.resolve(); await manual; runtime.stop(); }
+  });
+
+  it('consumes a recovered once task even when dispatch fails', async () => {
+    vi.setSystemTime(UTC(2026, 0, 1, 12, 0));
+    const task = { ...makeTask({ kind: 'once', date: '2026-01-01', time: '09:00' }), catchUpOnStartup: true };
+    task.state.nextRunAt = Date.now() - HOUR;
+    globalThis.fetch = vi.fn(async () => { throw new Error('Synthetic dispatch failure'); });
+    const { runtimes, projectConfigRuntime } = await startInstances(1, task);
+    try {
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect((await projectConfigRuntime.listScheduledTasks('p1'))[0]).toMatchObject({
+        enabled: false, state: { lastStatus: 'error', lastScheduledFor: task.state.nextRunAt },
+      });
+      expect((await projectConfigRuntime.listScheduledTasks('p1'))[0].state.nextRunAt).toBeUndefined();
+    } finally { runtimes.forEach((runtime) => runtime.stop()); }
   });
 
   it('ONE instance fires a daily 15:00 task exactly once at 15:00', async () => {

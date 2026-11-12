@@ -2,6 +2,7 @@ import * as React from 'react';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
+import { SettingsCheckboxRow } from '@/components/sections/shared/SettingsSection';
 import { toast } from '@/components/ui';
 import { Icon } from "@/components/icon/Icon";
 import { Spinner } from "@/components/ui/spinner";
@@ -439,6 +440,21 @@ export function ScheduledTasksView({ layout, onLeave }: {
     }
   }, [reloadTasks, t]);
 
+  const handleToggleCatchUp = React.useCallback(async (task: ScheduledTask, catchUpOnStartup: boolean) => {
+    const projectID = listOwnerRef.current;
+    if (!projectID) return;
+    setMutatingTaskID(task.id);
+    try {
+      // Send only the option: the card's runtime state may already be stale.
+      await upsertScheduledTask(projectID, { id: task.id, catchUpOnStartup });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.updateFailed'));
+    } finally {
+      await reloadTasks(projectID, { silent: true });
+      setMutatingTaskID((current) => current === task.id ? null : current);
+    }
+  }, [reloadTasks, t]);
+
   const handleEditTask = React.useCallback((task: ScheduledTask) => {
     if (!task.loopFile) {
       setEditorTask(task);
@@ -722,6 +738,16 @@ export function ScheduledTasksView({ layout, onLeave }: {
                     <span className="min-w-0 break-words">{task.state.lastError}</span>
                   </div>
                 ) : null}
+
+                <SettingsCheckboxRow
+                  className="mt-3"
+                  checked={task.catchUpOnStartup === true}
+                  onChange={(catchUpOnStartup) => void handleToggleCatchUp(task, catchUpOnStartup)}
+                  label={t('sessions.scheduledTasks.dialog.catchUpOnStartup.label')}
+                  info={t('sessions.scheduledTasks.dialog.catchUpOnStartup.hint')}
+                  ariaLabel={t('sessions.scheduledTasks.dialog.catchUpOnStartup.aria', { taskName: task.name })}
+                  disabled={isBusy}
+                />
 
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
                   <div className="inline-flex items-center gap-1">

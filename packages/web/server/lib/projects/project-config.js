@@ -1,6 +1,7 @@
 import { DateTime, IANAZone } from 'luxon';
 import { CronExpressionParser } from 'cron-parser';
 import { z } from 'zod';
+import { isDeepStrictEqual } from 'node:util';
 import { readProcessInstance } from '../scheduled-tasks/process-instance.js';
 
 import { projectConfigFileStemOf, projectPathFromId } from './project-id.js';
@@ -26,6 +27,8 @@ const MAX_TASK_PROMPT_LENGTH = 20_000;
 const MAX_CRON_LENGTH = 200;
 const MAX_BRANCH_LENGTH = 200;
 const MAX_LAST_ERROR_LENGTH = 2_000;
+const catchUpOnStartupSchema = z.boolean();
+const catchUpPatchSchema = z.strictObject({ id: z.string().trim().min(1), catchUpOnStartup: catchUpOnStartupSchema });
 const worktreeCleanupSchema = z.object({
   projectID: z.string().regex(/^[a-zA-Z0-9._:-]+$/),
   projectDirectory: z.string().min(1),
@@ -357,6 +360,10 @@ const normalizeTaskForStorage = (value, options) => {
   const enabled = typeof value.enabled === 'boolean'
     ? value.enabled
     : (existingTask?.enabled ?? true);
+  const catchUpOption = catchUpOnStartupSchema.safeParse(value.catchUpOnStartup);
+  const catchUpOnStartup = catchUpOption.success
+    ? catchUpOption.data
+    : existingTask?.catchUpOnStartup === true;
 
   const schedule = normalizeSchedule(value.schedule, existingTask?.schedule);
   const targetSessionId = asNonEmptyString(value.targetSessionId);
@@ -397,6 +404,9 @@ const normalizeTaskForStorage = (value, options) => {
     createdAt: existingTask?.state?.createdAt ?? baseState.createdAt ?? nowMs,
     updatedAt: refreshUpdatedAt ? nowMs : baseState.updatedAt ?? nowMs,
   };
+  if (existingTask && (enabled !== existingTask.enabled || !isDeepStrictEqual(schedule, existingTask.schedule))) {
+    delete state.nextRunAt;
+  }
 
   const storedTask = {
     id,
@@ -408,6 +418,7 @@ const normalizeTaskForStorage = (value, options) => {
     ...(loopFile ? { loopFile } : {}),
   };
   if (runInWorktree) storedTask.runInWorktree = true;
+  if (catchUpOnStartup) storedTask.catchUpOnStartup = true;
   if (baseBranchRaw) storedTask.baseBranch = baseBranchRaw;
   if (cleanupWorktree === false) storedTask.cleanupWorktree = false;
   if (targetSessionId) storedTask.targetSessionId = targetSessionId;
@@ -734,7 +745,14 @@ export const createProjectConfigRuntime = (deps) => {
         : -1;
       const existingTask = existingIndex >= 0 ? current.scheduledTasks[existingIndex] : null;
 
-      const normalizedTask = normalizeTaskForStorage(taskInput, {
+      // The card changes only this local option. Merge under the lock so it
+      // cannot restore stale enablement, configuration, or occurrence state.
+      const catchUpPatch = catchUpPatchSchema.safeParse(taskInput);
+      if (catchUpPatch.success && !existingTask) throw new Error('task.id is invalid: task not found');
+      const input = existingTask && catchUpPatch.success
+        ? { ...existingTask, ...catchUpPatch.data }
+        : taskInput;
+      const normalizedTask = normalizeTaskForStorage(input, {
         now,
         createId: taskIDFactory,
         existingTask,
